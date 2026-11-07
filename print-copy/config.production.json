@@ -1,0 +1,23 @@
+{
+  "ApiUrl": "https://restaurant-api-prod-hqf5ascneseveyg8.eastus-01.azurewebsites.net",
+  "Copy": {
+    "ConnectionString": "",
+    "ContainerName": "generated-files",
+    "TenantId": "a693a46a-976d-4055-ac4f-f82320c31fbf",
+    "LocalFolder": "toPrint",
+    "StateFile": "copy-state.json",
+    "PollIntervalSeconds": 5
+  },
+  "Print": {
+    "Simulate": true,
+    "SumatraPath": "C:\\Users\\GABRIEL\\AppData\\Local\\SumatraPDF\\SumatraPDF.exe",
+    "PrintedFolder": "Printed",
+    "ErrorFolder": "error",
+    "Printers": {
+      "PARRILLA": "PARRILLA",
+      "HELADERIA": "HELADERIA",
+      "CAJA": "CAJA",
+      "RECEIPT": "CAJA"
+    }
+  }
+}

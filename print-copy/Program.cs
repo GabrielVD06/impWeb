@@ -1,7 +1,4 @@
 using System.Diagnostics;
-using System.Runtime.Versioning;
-using System.Security.Cryptography;
-using System.Text;
 using System.Text.Json;
 using Azure.Storage.Blobs;
 using Azure.Storage.Blobs.Models;
@@ -11,14 +8,10 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
+var configFile = ResolveConfigFile(args);
 var builder = Host.CreateApplicationBuilder(args);
-
-if (ConnectionSecret.IsProtectRequest(args))
-{
-    ConnectionSecret.ProtectFromArgs(args, builder.Environment.ContentRootPath, builder.Configuration);
-    return;
-}
-
+builder.Configuration.AddJsonFile(configFile, optional: false, reloadOnChange: false);
+builder.Services.Configure<GatewayOptions>(builder.Configuration);
 builder.Services.Configure<CopyOptions>(builder.Configuration.GetSection("Copy"));
 builder.Services.Configure<PrintOptions>(builder.Configuration.GetSection("Print"));
 builder.Services.AddSingleton<PdfCopier>();
@@ -26,6 +19,41 @@ builder.Services.AddSingleton<TicketPrinter>();
 builder.Services.AddHostedService<CopyWorker>();
 
 await builder.Build().RunAsync();
+
+static string ResolveConfigFile(string[] args)
+{
+    for (var i = 0; i < args.Length; i++)
+    {
+        if (!args[i].Equals("--env", StringComparison.OrdinalIgnoreCase))
+            continue;
+        if (i + 1 >= args.Length)
+            throw new InvalidOperationException("Indique el ambiente: --env development o --env production.");
+        return ConfigFileFor(args[i + 1]);
+    }
+
+    return ConfigFileFor("development");
+}
+
+static string ConfigFileFor(string name)
+{
+    if (name.Equals("development", StringComparison.OrdinalIgnoreCase) ||
+        name.Equals("dev", StringComparison.OrdinalIgnoreCase) ||
+        name.Equals("desarrollo", StringComparison.OrdinalIgnoreCase))
+        return "config.development.json";
+
+    if (name.Equals("production", StringComparison.OrdinalIgnoreCase) ||
+        name.Equals("prod", StringComparison.OrdinalIgnoreCase) ||
+        name.Equals("produccion", StringComparison.OrdinalIgnoreCase) ||
+        name.Equals("producción", StringComparison.OrdinalIgnoreCase))
+        return "config.production.json";
+
+    throw new InvalidOperationException($"Ambiente desconocido: {name}. Use development o production.");
+}
+
+internal sealed class GatewayOptions
+{
+    public string ApiUrl { get; set; } = "";
+}
 
 internal sealed class CopyOptions
 {
@@ -99,6 +127,7 @@ internal sealed class PdfCopier
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
 
     private readonly CopyOptions _options;
+    private readonly GatewayOptions _gateway;
     private readonly IHostEnvironment _environment;
     private readonly ILogger<PdfCopier> _logger;
     private readonly BlobContainerClient _container;
@@ -110,14 +139,21 @@ internal sealed class PdfCopier
 
     public int PollIntervalSeconds => Math.Max(2, _options.PollIntervalSeconds);
 
-    public PdfCopier(IOptions<CopyOptions> options, IHostEnvironment environment, ILogger<PdfCopier> logger)
+    public PdfCopier(
+        IOptions<GatewayOptions> gateway,
+        IOptions<CopyOptions> options,
+        IHostEnvironment environment,
+        ILogger<PdfCopier> logger)
     {
+        _gateway = gateway.Value;
         _options = options.Value;
         _environment = environment;
         _logger = logger;
 
-        var connectionString = ConnectionSecret.Load(_environment.ContentRootPath, _options.ConnectionString, _logger);
-        _container = new BlobContainerClient(connectionString, _options.ContainerName);
+        if (string.IsNullOrWhiteSpace(_options.ConnectionString))
+            throw new InvalidOperationException("Falta Copy:ConnectionString en el config.json de este ambiente.");
+
+        _container = new BlobContainerClient(_options.ConnectionString, _options.ContainerName);
         _prefixes = BuildPrefixes(_options.TenantId);
         _localFolder = Resolve(_options.LocalFolder);
         _statePath = Resolve(_options.StateFile);
@@ -128,6 +164,7 @@ internal sealed class PdfCopier
         Directory.CreateDirectory(_localFolder);
         _state = await LoadStateAsync(cancellationToken);
 
+        _logger.LogInformation("API {ApiUrl}", string.IsNullOrWhiteSpace(_gateway.ApiUrl) ? "(sin ApiUrl)" : _gateway.ApiUrl);
         _logger.LogInformation("Carpeta lista: {Folder}", _localFolder);
         if (string.IsNullOrWhiteSpace(_options.TenantId))
         {
@@ -481,113 +518,5 @@ internal sealed class TicketPrinter
         return Path.IsPathRooted(path)
             ? path
             : Path.Combine(_environment.ContentRootPath, path);
-    }
-}
-
-[SupportedOSPlatform("windows")]
-internal static class ConnectionSecret
-{
-    public const string FileName = "connection.protected";
-
-    private static readonly byte[] Entropy = Encoding.UTF8.GetBytes("print-copy-v1");
-
-    public static bool IsProtectRequest(string[] args) =>
-        args.Any(arg =>
-            arg.Equals("--protect", StringComparison.OrdinalIgnoreCase) ||
-            arg.Equals("--protect-file", StringComparison.OrdinalIgnoreCase));
-
-    public static void ProtectFromArgs(string[] args, string contentRoot, IConfiguration configuration)
-    {
-        var fileIndex = Array.FindIndex(
-            args,
-            arg => arg.Equals("--protect-file", StringComparison.OrdinalIgnoreCase));
-
-        string? sourceFile = null;
-        string secret;
-        if (fileIndex >= 0)
-        {
-            if (fileIndex + 1 >= args.Length || args[fileIndex + 1].StartsWith('-'))
-                throw new InvalidOperationException("Indique el archivo: dotnet run -- --protect-file ruta\\cadena.txt");
-
-            sourceFile = args[fileIndex + 1];
-            if (!File.Exists(sourceFile))
-                throw new InvalidOperationException($"No se encontró el archivo de la cadena: {sourceFile}");
-
-            secret = File.ReadAllText(sourceFile).Trim();
-        }
-        else
-        {
-            secret = configuration["Copy:ConnectionString"]?.Trim() ?? "";
-        }
-
-        if (string.IsNullOrWhiteSpace(secret))
-        {
-            throw new InvalidOperationException(
-                "No hay cadena para cifrar. Póngala un momento en Copy:ConnectionString, o pase un archivo con --protect-file.");
-        }
-
-        var plain = Encoding.UTF8.GetBytes(secret);
-        try
-        {
-            var protectedBytes = ProtectedData.Protect(plain, Entropy, DataProtectionScope.LocalMachine);
-            var destination = Path.Combine(contentRoot, FileName);
-            var partial = destination + ".partial";
-            File.WriteAllBytes(partial, protectedBytes);
-            File.Move(partial, destination, overwrite: true);
-            Console.WriteLine($"Cadena cifrada en {destination}.");
-            Console.WriteLine("Solo este equipo puede leerla. Borre Copy:ConnectionString de appsettings.json si todavía está.");
-        }
-        finally
-        {
-            Array.Clear(plain);
-        }
-
-        if (sourceFile is not null)
-            File.Delete(sourceFile);
-    }
-
-    public static string Load(string contentRoot, string configured, ILogger logger)
-    {
-        var path = Path.Combine(contentRoot, FileName);
-        if (File.Exists(path))
-        {
-            if (!string.IsNullOrWhiteSpace(configured))
-                logger.LogWarning("Copy:ConnectionString sigue en appsettings.json y no se usa. Bórrelo.");
-
-            logger.LogInformation("Conexión de Azure cifrada con la clave de este equipo.");
-            return Unprotect(path);
-        }
-
-        if (!string.IsNullOrWhiteSpace(configured))
-        {
-            logger.LogWarning("La cadena de Azure está en texto plano. En este PC ejecute: dotnet run -- --protect");
-            return configured;
-        }
-
-        throw new InvalidOperationException(
-            "Falta la cadena de Azure. En este PC ejecute: dotnet run -- --protect");
-    }
-
-    private static string Unprotect(string path)
-    {
-        byte[] plain;
-        try
-        {
-            plain = ProtectedData.Unprotect(File.ReadAllBytes(path), Entropy, DataProtectionScope.LocalMachine);
-        }
-        catch (CryptographicException)
-        {
-            throw new InvalidOperationException(
-                "connection.protected no se puede leer en este equipo. Vuelva a ejecutar --protect aquí.");
-        }
-
-        try
-        {
-            return Encoding.UTF8.GetString(plain);
-        }
-        finally
-        {
-            Array.Clear(plain);
-        }
     }
 }
