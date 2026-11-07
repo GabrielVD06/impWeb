@@ -1,0 +1,8 @@
+bin/
+obj/
+toPrint/
+Printed/
+error/
+copy-state.json
+connection.protected
+*.partial
